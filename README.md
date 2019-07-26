@@ -8,8 +8,8 @@ It is a _Work in Progress_, as I consolidate from a variety of hodge-podge utili
 
 The first tool:
 
-  *oz-aws-bootstrap* - create an securely designed VPC in Amazon (available in a container)
-  *rds-snap-clone* - automate a snapshot->clone of an EC2 instance
+*  *oz-aws-bootstrap* - create an securely designed VPC in Amazon (available in a container)
+*  *rds-snap-clone* - automate a snapshot->clone of an EC2 instance
 
 # oz-aws-bootstrap
 
