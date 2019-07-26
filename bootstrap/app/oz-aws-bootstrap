@@ -1,0 +1,1080 @@
+#!/usr/bin/env python3
+# vim:set expandtab ts=4 sw=4 ai ft=python:
+# vim modeline (put ":set modeline" into your ~/.vimrc)
+# License by GNU Affrero - Derived from Protos Library code and online examples
+"""
+
+bootstrap utility for enterprise networks.
+
+Opinionated network configurations.
+Simpler than a full terraform setup.
+
+"""
+# http://boto3.readthedocs.io/en/latest/reference/services/ec2.html#service-resource
+import os
+import sys
+import re
+import traceback
+import copy
+import json
+import dictlib
+import boto3
+import botocore.exceptions
+import yaml
+import time
+from rfx.optarg import Args
+import rfxcmd
+import ipcalc
+import json
+
+# TODO & notes:
+# - switch token from end to beginning of names
+# - allow more flexible tokens? nbu-p1?
+# - we currently pivot all logic off the Name tag; once a db is in place we can
+#   track objects off their ID and this is no longer required (nor reliable and good)
+
+DEBUG = True
+############################################################################
+def log(msg, *args, **kwargs):
+    print(msg.format(*args, **kwargs))
+
+################################################################################
+def load_data_file(path, abort=sys.exit):
+    """
+    Figure out which file to load from, and read in the data file, handling errors
+    """
+    try:
+        if path in ('@', '-'): # reflex argparser is not handling a single dash properly
+            spec = yaml.full_load(sys.stdin)
+            spec['_file_'] = '@stdin'
+            return spec
+        else:
+            if not os.path.exists(path):
+                abort("Cannot find template-file: " + path)
+            with open(path) as infile:
+                spec = yaml.full_load(infile)
+                spec['_file_'] = path
+                return spec
+    except Exception as err: # pylint: disable=broad-except
+        abort(str(err))
+
+################################################################################
+def ignore_boto(errs, func, *args, **kwargs):
+    """
+    Catch boto errors and abort with a friendlier message
+    """
+    try:
+        return func(*args, **kwargs)
+    except botocore.exceptions.ClientError as err:
+        if err.response['Error']['Code'] in errs:
+            return False
+        log("boto error = {}", err.response['Error'])
+        traceback.format_exc()
+        sys.exit(1)
+
+################################################################################
+def ignore(func, *args, **kwargs):
+    """
+    Just ignore it all
+    """
+    try:
+        func(*args, **kwargs)
+    except: # pylint: disable=bare-except
+        pass
+
+################################################################################
+def good(condition, msg, *args, **kwargs):
+    """Similar to assert, but always inline (not compiled out) and with more
+       formatting functionality"""
+
+    if not condition:
+        msg = msg.format(*args, **kwargs)
+        if kwargs.get('abort'):
+            kwargs.get('abort')(msg)
+        else:
+            sys.exit(msg)
+
+################################################################################
+def missing(obj, key, abort=None, pre=None):
+    """
+    Recursively pull from a dictionary, using dot notation. Fail if not found.
+    >>> missing({"a":{"b":{"c":1}}}, "a.b.c")
+    1
+    >>> missing({"a":{"b":{"c":1}}}, "a.d.c")
+    Traceback (most recent call last):
+    ...
+    SystemExit: a.d is missing
+    """
+    return _missing(obj, [], key.split("."), abort=abort, pre=pre)
+
+def _missing(obj, parents, key, abort=None, pre=None):
+    if not obj.get(key[0]):
+        msg = ".".join(parents)
+        if msg:
+            msg += "."
+        if pre:
+            msg = pre + ": " + msg
+        msg += key[0] + " is missing"
+        if abort:
+            abort(msg)
+        if DEBUG:
+            for line in traceback.format_stack():
+                sys.stdout.write(line)
+        sys.exit(msg)
+        return False
+    if len(key) == 1:
+        return True
+    parents.append(key[0])
+    return _missing(obj[key[0]], parents, key[1:], abort=abort, pre=pre)
+
+################################################################################
+# used with calculate_network
+def int2net(nbr, mask):
+    """
+    Convert an integer into a network IP address
+    """
+    return ipcalc.Network("{}/{}".format(ipcalc.IP(nbr), mask))
+
+def masktrim(mask):
+    """
+    Trim up a string, with the / being optional for a netmask
+    """
+    if isinstance(mask, str):
+        if mask[0] == '/':
+            mask = mask[1:]
+        mask = int(mask)
+    return mask
+
+def alnum(enum):
+    """
+    Return the alphabetic number offset
+    """
+    return "abcdefghijklmnop"[enum]
+
+def net2str(net):
+    """
+    A standard formatted network address with /netmask
+    """
+    return str(net.network()) + "/" + str(net.mask)
+
+def format_net(net):
+    """
+    A standard formatted network explanation
+    """
+    return "{:15} {:>5} ips  {}-{}"\
+        .format(str(net.network()) + "/" + str(net.mask),
+                net.size(), net.host_first(), net.host_last())
+
+############################################################################
+## TODO: support a security group reference as well as @group.
+def group_expand(scan, cache={}, sortvals=False):
+    """
+    Accept a dictionary `scan` with values as lists or strings. Recursively
+    walk the keys and values, converting all values to lists and expanding any
+    @name value, to be a set union including the @name from the `scan`
+    value, or `cache` (a dict to use as a secondary priority, when key cannot be
+    found).
+
+    Note: sortvals=True is just to help the doctest values to match properly
+
+    >>> group_expand({"a":["x","y"], "b":"z", "c":["x","Z"]}, sortvals=True)
+    {'a': ['x', 'y'], 'b': ['z'], 'c': ['Z', 'x']}
+    """
+    out = dictlib.Obj()
+
+    for key in scan:
+        val = scan[key]
+        if isinstance(val, str):
+            val = [val]
+        new_val = group_expand_values(val, key=key, outer=out, cache=cache, sortvals=sortvals)
+
+        if sortvals:
+            out[key] = sorted(new_val)
+        else:
+            out[key] = new_val
+
+    return out
+
+def group_expand_values(values, key='', outer={}, cache={}, sortvals=False):
+    new_val = set()
+    for elem in values:
+        if not elem:
+            continue
+#        if not isinstance(elem, str):
+#            expn_val.append(elem)
+#            continue
+        if elem[0] == '@':
+            ref_key = elem[1:]
+            ref_val = None
+            if outer.get(ref_key):
+                ref_val = outer.get(ref_key)
+            elif cache.get(ref_key):
+                ref_val = cache.get(ref_key)
+            good(ref_val,
+                 "Reference group {} is not defined before {} where it is referenced",
+                 elem, key)
+            if isinstance(ref_val, list):
+                for item in ref_val:
+                    if isinstance(item, dict):
+                        if item.get('CidrIp'):
+                            new_val.add(item['CidrIp'])
+                        else:
+                            sys.exit("group_expand cannot insert a dictionary")
+                    else:
+                        new_val.add(item)
+        else:
+            new_val.add(elem)
+    return list(new_val)
+
+################################################################################
+# pylint: disable=too-few-public-methods
+class Provider(object):
+    """
+    Wrapper class for polymorphism on any provider.
+    """
+    def __new__(cls, *args, **kwargs):
+        spec = kwargs.get('spec')
+        good(spec, "Provider spec arg is undefined")
+
+        target = kwargs.get('target')
+        good(target, "Provider target arg is undefined")
+
+        provider_name = target.get('provider', {}).get('name')
+        good(provider_name,
+             "Target provider ({}) is not defined",
+             target.get('id').get('name'))
+
+        missing(spec, "resources.providers." + provider_name, pre=spec.get("_file_"))
+        provider_data = spec.resources.providers.get(provider_name)
+
+        provider_type = provider_data.get('type')
+        good(provider_type,
+             "Provider {} has no type defined",
+             provider_name)
+
+        actual_class = globals().get('Provider' + provider_type.title())
+        good(actual_class, "Provider {} not supported", actual_class)
+
+        return actual_class(*args, **kwargs, provider=provider_data)
+
+################################################################################
+# pylint: disable=too-many-instance-attributes
+class ProviderRoot(object):
+    target = None
+    spec = None
+    cache = None
+    args = None
+    commit = True
+    provider = None
+    specfile = ''
+    profile = None
+    _sec = None
+    label = ''
+
+    def __repr__(this):
+        return """<{} object target={} spec={} cache={} args={} commit={} provider={} specfile={} profile={} _sec={} label={}>""".format(
+          this.__class__.__name__, this.target, this.spec, this.cache, this.args, this.commit,
+          this.provider, this.specfile, this.profile, this._sec, this.label
+        )
+
+class ProviderAws(ProviderRoot):
+    """
+    AWS Provider
+    """
+    ############################################################################
+    # pylint: disable=too-many-arguments
+    def __init__(self, args, spec=None, target=None, provider=None, profile=None):
+        self.target = target
+        good(target, "Invalid target")
+        self.spec = spec
+        self.specfile = self.spec.get('_file_')
+        good(target, "Invalid spec")
+        self.args = args
+        self.profile = 'oz' # profile
+        good(target, "Invalid profile")
+        for label in ('templates', 'resources', 'deploy', 'version'):
+            missing(spec, label, pre=self.specfile)
+        good(self.spec.version == 1, "Specfile version is not 1.0")
+        self.commit = not args.get('--dry-run')
+        self.cache = dictlib.Obj()
+        good(provider.get('one_time_admin'), "provider.one-time-admin is not defined")
+        self.label = self.profile + '.' + self.target.id.token + ': '
+        aws_args = dict(region_name=target.provider.region)
+
+        if provider.one_time_admin.get('profile'):
+            aws_args['profile_name'] = provider.one_time_admin.profile
+            self.log("aws.profile {}", provider.one_time_admin.profile)
+
+        elif provider.one_time_admin.get('aws_access_key_id') and\
+             provider.one_time_admin.get('aws_secret_access_key'):
+            self.log("aws.access_key_id {}", provider.one_time_admin.aws_access_key_id)
+
+            aws_args['aws_access_key_id'] = provider.one_time_admin.aws_access_key_id
+            aws_args['aws_secret_access_key'] = provider.one_time_admin.aws_secret_access_key
+
+        else:
+            sys.exit("provider.one-time-admin has no profile or access information")
+
+        self.log("aws.region {}", target.provider.region)
+
+        self.cache.aws = boto3.session.Session(**aws_args)
+        self.cache.ec2 = self.cache.aws.resource('ec2')
+        self.cache['_account_id_'] = self.cache.aws.client('sts').get_caller_identity().get('Account')
+#        self.cache.iam = self.cache.iam.resource('iam')
+
+    ############################################################################
+    def log(self, msg, *args, **kwargs):
+        print((self.label + msg).format(*args, **kwargs))
+
+    ############################################################################
+    def get_ref(self, *more):
+        """return a commonly formatted target as it is in the specfile"""
+        if more:
+            more = more[0]
+        else:
+            more = ''
+        return self.specfile + ": " + self.profile + "." + self.target.id.token + more
+
+    ############################################################################
+    def stamp_label(self, label):
+        """return a label with our token stamped on it"""
+        return self.target.id.token + "-" + label
+
+    ############################################################################
+    def setup_master(self):
+        """setup nanobox access to provider"""
+        self.add_ssh_key()# self.target.ssh_key)
+
+        # TODO: create an IAM user & policies for the rest of this
+#        self.cache.iam.create_policy(
+#            PolicyName='myDynamoDBPolicy',
+#            PolicyDocument=json_dumps({
+#              "Version": "2012-10-17",
+#              "Statement": [
+#                  {
+#                      "Effect": "Allow",
+#                      "Resource": "RESOURCE_ARN"
+#                  },
+#                  {
+#                      "Effect": "Allow",
+#                      "Action": [
+#                      ],
+#                      "Resource": "RESOURCE_ARN"
+#                  }
+#              ]
+#          }
+
+    ############################################################################
+    def set_tag(self, idnbr, key, value):
+        """set a tag on an ec2 object"""
+        if self.commit:
+            self.cache.ec2.create_tags(
+                Resources=[idnbr],
+                Tags=[{'Key': key, 'Value': value}])
+
+    ############################################################################
+    def preload(self, cstr):
+        """bring some ec2 objects into cache"""
+        items = getattr(self.cache.ec2, cstr + 's')
+        for item in items.filter(): # Filters = [{'Name': 'tag:Name', 'Values' : [label]}]):
+            if not item.tags:
+                continue
+            for tag in item.tags:
+                if tag['Key'] == 'Name':
+                    name = tag['Value']
+                    if name:
+                        self.cache[name] = item
+                    break
+
+    ############################################################################
+    def boto_get(self, obj, cstr, filters):
+        items = getattr(obj, cstr + 's')
+        matches = dict()
+        for item in items.filter(Filters=filters): #[{'Name': 'tag:Name', 'Values' : [label]}]):
+            matches[item.id] = item
+        match_keys = list(matches.keys())
+        if len(match_keys) > 1:
+            print(match_keys)
+            raise TypeError("Too many mathes for {}={}".format(cstr, filters))
+
+        elif len(match_keys) == 1:
+            return matches[match_keys[0]]
+        return None
+
+    ############################################################################
+    def present(self, cstr, label, obj, *args, **kwargs):
+        """
+        Assertion to define object if it doesn't exist in cache.
+        After definition, object is in cache.
+
+        `cstr` is the boto3 class string, like 'ec2' or 'vpc'.  This becomes
+           a derived method call for obj.create_ + cstr or listing
+        `label` is the unique Name tag it has been given
+        `obj` is the boto3 object to use in the call
+        `*args` and `**kwargs` are sent onto the boto3 object create
+        """
+        # use our local cache; assumes no name duplication
+        existing = ' (existing)'
+        created = False
+        if self.cache.get(label):
+            item = self.cache.get(label)
+            existing = ' (existing; cached)'
+
+        # otherwise check remote and create if necessary
+        else:
+            item = self.boto_get(obj, cstr, [{'Name': 'tag:Name', 'Values' : [label]}])
+            if not item:
+                item = None
+                try:
+                    if self.commit:
+                        item = getattr(obj, 'create_' + cstr)(*args, **kwargs)
+                        if item == None:
+                            sys.exit("{}.create_{}({}, {}) => None?".format(obj, cstr, args, kwargs))
+
+                        # try a couple of waiters
+                        waited = False
+                        for x in ('available', 'exists'):
+                            try:
+                                #print("wait_until_" + x)
+                                getattr(obj, 'wait_until_' + x)()
+                                waited = True
+                            except AttributeError:
+                                pass # try the next
+
+                        # waiters aren't available at all levels
+                        if not waited:
+                            state = 'unknown'
+                            #print("trying other waits...")
+                            while state != 'available':
+                                try:
+                                    avitem = self.boto_get(obj, cstr, [{'Name': cstr.replace('_','-') + '-id', 'Values' : [item.id]}])
+                                    if not avitem: # guess not
+                                        state = 'available'
+                                    else:
+                                        state = avitem.state
+                                        if state != 'available':
+                                            time.sleep(1)
+                                except:
+                                    # we tried, ohwell--not all AWS data is shaped the same
+                                    state = 'available'
+
+                        created = True
+                        tagged = False
+                        count=5
+                        while not tagged:
+                            try:
+                                #print("tag? {} Name={}".format(item.id, label))
+                                self.set_tag(item.id, "Name", label)
+                                tagged = True
+                            except Exception as err:
+                                count -= 1
+                                if count <= 0:
+                                    traceback.print_exc()
+                                    sys.exit("Cannot continue")
+                                time.sleep(1)
+
+                except botocore.exceptions.ClientError as err:
+                    sys.exit(err)
+
+                existing = ''
+
+            self.cache[label] = item
+            self.cache[cstr] = item
+
+        if not item and not self.commit:
+            sys.exit("Object {} doesn't exist, cannot continue in dry-run".format(label))
+        self.log("{} {} = {}{}", cstr, label, item.id, existing)
+        return item, created
+
+    ############################################################################
+    def present_sg(self, label):
+        """
+        Is a security group present?
+
+        wraps self.present with the uniqueness of how security groups are
+        """
+        # *sigh* aws doesn't want us to have GroupNames beginning with sg-;
+        # but we want it to keep a clean namespace
+        name = self.stamp_label(label)
+        sgrp, _ = self.present('security_group',
+                               'sg-' + name,
+                               self.cache.ec2,
+                               GroupName=name,
+                               Description='sg-' + name + ' auto-created',
+                               VpcId=self.cache.vpc.id)
+        return sgrp
+
+    ############################################################################
+    # pylint: disable=too-many-branches
+    def set_sg_rules(self, rule_type, sgrp, rules):
+        """
+        Set a security group rule.
+        """
+        if rule_type == 'ingress':
+            cur2 = copy.deepcopy(sgrp.ip_permissions)
+        else:
+            cur2 = copy.deepcopy(sgrp.ip_permissions_egress)
+
+        # not easy to compare, when we have default values coming back at us
+        # trim up the current rules so we can more reliably compare
+        for rule in cur2:
+            if rule.get('UserIdGroupPairs'):
+                key = 'UserIdGroupPairs'
+                for x in range(0, len(rule[key])): # pylint: disable=invalid-name
+                    if rule[key][x].get('UserId'):
+                        del rule[key][x]['UserId']
+
+                rule[key] = sorted(rule[key], key=lambda item: item['GroupId'])
+            if rule.get('IpRanges'):
+                key = 'IpRanges'
+                for x in range(0, len(rule[key])): # pylint: disable=invalid-name
+                    if rule[key][x].get('Description'):
+                        del rule[key][x]['Description']
+
+                # sort elements by IP so they are comparable
+                rule[key] = sorted(rule[key], key=lambda item: item['CidrIp'])
+
+            # strip out empty lists and whatnot
+            for key in list(rule.keys()):
+                if not rule[key] and rule[key] != 0: # but keep 0
+                    del rule[key]
+
+        # also straighten up our incoming rules to be comparable
+        for rule in rules:
+            if rule.get('IpRanges'):
+                # I don't know if its a bug, or expected, but sometimes this is a nested list
+                ip_ranges = rule['IpRanges']
+                if isinstance(ip_ranges[0], list):
+                    if len(ip_ranges) > 1:
+                        sys.exit("Unexpected data in IpRanges for rule:\n" +
+                                 json_dumps(rule, indent=2))
+                    ip_ranges = ip_ranges[0]
+                rule['IpRanges'] = sorted(ip_ranges, key=lambda item: item['CidrIp'])
+            if rule.get('UserIdGroupPairs'):
+                rule['UserIdGroupPairs'] =\
+                    sorted(rule['UserIdGroupPairs'], key=lambda item: item['GroupId'])
+
+        # ugly way to get keys sorted; key order SHOULD not matter, but
+        sg_add = list()
+        sg_del = list()
+        for rule in cur2:
+            if rule not in rules:
+                self.log("del {} {} rule {}",
+                         rule_type, sgrp.group_name, json_dumps(rule, sort_keys=True))
+                sg_del.append(rule)
+        for rule in rules:
+            if rule not in cur2:
+                self.log("add {} {} rule {}",
+                         rule_type, sgrp.group_name, json_dumps(rule, sort_keys=True))
+                sg_add.append(rule)
+
+        if self.commit:
+            if sg_del:
+                getattr(sgrp, 'revoke_' + rule_type)(IpPermissions=sg_del)
+            if sg_add:
+                ignore_boto('InvalidPermission.Duplicate',
+                            getattr(sgrp, 'authorize_' + rule_type),
+                            IpPermissions=sg_add)
+
+    ############################################################################
+    def add_ssh_key(self):
+        """
+        Add an ssh key to provider if it is needed, as it is defined on the target
+        """
+        ssh_key = self.spec.resources.ssh_keys.get(self.target.ssh_key)
+
+        # get the keymaterial first
+        if not ssh_key.get('material'):
+            if ssh_key.get('file'):
+                # try variants
+                def _find_pubkey(filename):
+                    ssh_home = os.path.expanduser("~/.ssh/")
+                    for path in (filename + '.pub', filename,
+                                 ssh_home + filename + '.pub',
+                                 ssh_home + filename):
+                        if os.path.exists(path):
+                            return path
+                    return None
+
+                filename = _find_pubkey(ssh_key.get('file'))
+                if not filename:
+                    sys.exit("Cannot find file for {}={}"
+                             .format(self.get_ref('.ssh_key.file'), ssh_key.file))
+
+                self.log("reading key material from file {}", filename)
+                with open(filename) as infile:
+                    ssh_key['material'] = infile.read()
+
+        if not ssh_key.material:
+            sys.exit("No ssh key material? {} or file defined"
+                     .format(self.get_ref('.ssh_key.material')))
+
+        # load existing keys
+        keypairs = {}
+        for key in self.cache.ec2.key_pairs.filter():
+            #TODO, test & verify: Filters = [{'Name': 'tag:Name', 'Values' : [ssh_key.name]}]):
+            keypairs[key.name] = key
+
+        if not keypairs.get(ssh_key.name):
+            self.log("keypair " + ssh_key.name)
+            self.cache.ec2.import_key_pair(
+                KeyName=ssh_key.name,
+                PublicKeyMaterial=ssh_key.material)
+
+    ############################################################################
+    def create_network(self):
+        """
+        Calculate all of the network blocks from the template definition, and
+        then define the VPC, routers and subnets.
+        """
+        good(self.calculate_networks(), "Unable to properly calculate networks")
+
+        vpc_cidr = self.target.network.cidr
+
+        # create VPC
+        vpc, _ = self.present('vpc',
+                              self.stamp_label(self.profile),
+                              self.cache.ec2,
+                              CidrBlock=vpc_cidr)
+        vpc.wait_until_available()
+
+        # create an internet gateway
+        igw, _ = self.present('internet_gateway', self.stamp_label("igw"), self.cache.ec2)
+
+        # attach it if it isn't attached
+        attached = list(filter(lambda x: x['VpcId'] == vpc.id and x['State'] == 'available',
+                               igw.attachments))
+        if not attached:
+            self.log("internet_gateway attaching to vpc " + vpc.id)
+            ignore(vpc.attach_internet_gateway, InternetGatewayId=igw.id)
+
+        # create a route table and a public route; a little different approach as this is
+        # auto-created for us, so we want to try to re-use the default
+        route_table_label = self.stamp_label('rtb')
+        route_table = self.cache.get(route_table_label)
+        if not route_table:
+            # take the first one
+            route_tables = list(vpc.route_tables.all())
+            if not route_tables:
+                route_table, _ = self.present('route_table', route_table_label, vpc)
+            else:
+                route_table = route_tables[0]
+                self.set_tag(route_table.id, "Name", route_table_label)
+            self.cache['route_table'] = route_table
+
+        # TODO: we endup with a separate route table that is the default/main one, ideally
+        # we would just re-use the one created by default, instead of searching by name
+        self.cache['route_assoc'] = {}
+        for assoc in route_table.associations:
+            self.cache['route_assoc'][assoc.subnet_id] = assoc
+
+        # add a default/0.0.0.0/0 route?
+        public = list(filter(lambda x: x.destination_cidr_block == '0.0.0.0/0', route_table.routes))
+        if not public:
+            self.log("route_table adding public route to " + igw.id)
+            route_table.create_route(
+                DestinationCidrBlock='0.0.0.0/0',
+                GatewayId=igw.id
+            )
+
+        # speedup - cache a list of all subnets
+        self.preload('subnet')
+
+    ############################################################################
+    def create_zones(self):
+        """For each zone in zones..."""
+        for zone in self.target.network.zones:
+            self.create_zone(zone)
+
+    ############################################################################
+    def create_zone(self, zone):
+        """Create subnets for a specified zone"""
+        for keypair in zone.get('subnets'):
+            label = list(keypair.keys())[0]
+            cidr = keypair[label]
+
+            subnet, _ = self.present('subnet',
+                                     label,
+                                     self.cache.ec2,
+                                     CidrBlock=cidr,
+                                     VpcId=self.cache.vpc.id)
+
+            if not self.cache.route_assoc.get(subnet.id):
+                # associate the route table with the subnet
+                self.cache.route_assoc[subnet.id] = \
+                    self.cache.route_table.associate_with_subnet(SubnetId=subnet.id)
+
+    ############################################################################
+    def _prep_security_controls(self):
+        """Prepare to do security controls work.  Expand security groups, etc"""
+        self.preload('security_group')
+
+        self._sec = dictlib.Obj()
+        _groups = self.spec.get('resources', {}).get('network-groups', {})
+        self._sec['groups'] = groups = group_expand(_groups)
+        for grp in groups:
+            groups[grp] = as_aws_netblock(groups[grp])
+
+    ############################################################################
+    def sg_map(self, sg, type, protocols, targets):
+        target_cidr = []
+        target_sg = []
+        for target in as_aws_netblock(targets):
+            if target.get('CidrIp'):
+                target_cidr.append(target)
+            elif target.get('GroupId'):
+                target_sg.append(target)
+
+        changes = []
+        for pstr in protocols:
+            proto, port = (pstr + "/").split("/")[0:2]
+            from_port, to_port = (port + "-" + port).split("-")[0:2]
+            if from_port:
+                if from_port == '*':
+                    from_port = 0
+                else:
+                    from_port = int(from_port)
+            else:
+                from_port = -1
+            if to_port:
+                if to_port == '*':
+                    to_port = 65535
+                else:
+                    to_port = int(to_port)
+            else:
+                to_port = -1
+
+            change = {
+                "IpProtocol": proto,
+                "FromPort": from_port,
+                "ToPort": to_port
+            }
+            if target_cidr:
+                change['IpRanges'] = target_cidr
+
+            if target_sg:
+                change['UserIdGroupPairs'] = target_sg
+
+            changes.append(change)
+        self.set_sg_rules(type, sg, changes)
+
+    ############################################################################
+    # pylint: disable=unused-variable
+    def setup_network(self, spec=None):
+        """Create network controls"""
+        self._prep_security_controls()
+
+        grps = self._sec['groups']
+        rules = spec.resources.firewall_rules
+
+        for name in rules.__original__().keys():
+            rule = rules[name]
+            for type in ('ingress.src', 'egress.dst'):
+                iplist = dictlib.dig_get(rule, type)
+                if iplist:
+                    dictlib.dug(rule, type, group_expand_values(iplist, cache=grps))
+                else:
+                    dictlib.dug(rule, type, None)
+
+            target_rules = []
+            target_hosts = []
+            changes = []
+            sg = self.present_sg(name)
+            if dictlib.dig_get(rule, 'ingress.src'):
+                self.sg_map(sg, 'ingress', rule.ingress.services, rule.ingress.src)
+            else:
+                self.set_sg_rules('ingress', sg, [])
+            if dictlib.dig_get(rule, 'egress.dst'):
+                self.sg_map(sg, 'egress', rule.egress.services, rule.egress.dst)
+            else:
+                self.set_sg_rules('egress', sg, [])
+
+    ################################################################################
+    # pylint: disable=too-many-locals
+    def calculate_networks(self):
+        """
+        Black magic mojo hacking with `ipcalc` to get our networks straight.
+        Follow template, and add each subnet within a subset of the greater
+        network block, without overlapping other subnets.
+        """
+
+        missing(self.target, "network.template", pre=self.specfile)
+        missing(self.target, "network.start", pre=self.specfile)
+        nets = self.spec.templates.get(self.target.network.template)
+        net = ipcalc.Network(self.target.network.start)
+        self.log("net base      " + format_net(net))
+
+        # first pass just scope the zone
+        start = int(net)
+        prev = None
+        for x in range(0, len(nets['zones'])): # pylint: disable=invalid-name
+            zone = dictlib.Obj(nets['zones'][x])
+            zone.mask = masktrim(zone.mask)
+            zone.slice = masktrim(zone.slice)
+            zone['label'] = self.stamp_label(zone.name)
+            nets['zones'][x] = zone
+
+            # check that we are sized properly
+            zone_net = int2net(start, zone.mask)
+            zonea_net = int2net(start, zone.slice)
+            if zonea_net.size() * zone.count > zone_net.size():
+                sys.exit("Zone {} /{} ({} hosts) is too small for {}x /{} networks ({} hosts)"
+                         .format(zone.name, zone.mask, zone_net.size(),
+                                 zone.count, zone.slice, zonea_net.size() * zone.count))
+
+            # check that we aren't stomping on the previous zone
+            if prev and prev in zone_net:
+                self.log("net IP RANGE GAP")
+                start = int(zone_net + zone_net.size()) + 1
+                zone_net = int2net(start, zone.mask)
+
+            self.log("net zone {}  {:20}"
+                  .format(zone.label, format_net(int2net(zone_net.network(), zone.mask))))
+            zone.cidr = str(net2str(zone_net))
+
+            prev = zone_net
+            start = int(zone_net + zone_net.size())
+
+        # second pass, do the subnets
+        zones = list()
+        for zone in nets['zones']:
+            # now enumerate our range for each avz
+            zone['subnets'] = subs = list()
+            start = ipcalc.Network(zone.cidr)
+
+            for x in range(0, zone.count): # pylint: disable=invalid-name
+                subnet = ipcalc.Network(int2net(start, zone.slice), zone.slice)
+                start = int(subnet + subnet.size())
+                subdetail = dictlib.Obj(
+                    net=str(subnet.network()),
+                    mask=subnet.mask,
+                    cidr=net2str(subnet),
+                    enum=alnum(x),
+                )
+                label = zone.label + "-" + subdetail.enum
+                sub = {label: subdetail.cidr}
+                subs.append(sub)
+                self.log("net block {} {}".format(label, format_net(ipcalc.Network(subdetail.cidr))))
+
+            zone_trim = zone.__export__()
+            del zone_trim['mask']
+            del zone_trim['slice']
+            del zone_trim['count']
+            del zone_trim['name']
+            zones.append(zone_trim)
+
+        self.target.network.cidr = str(net)
+        self.target.network.zones = zones
+        return True
+
+    ############################################################################
+    def setup_failover(self):
+        """
+        setup a failover controller
+        """
+        if self.profile != 'controller':
+            raise Exception("Failover only supported for controllers")
+        self.setup_primary()
+
+    ############################################################################
+    def setup_primary(self):
+        """Do the basic work, within a given grid or controller"""
+        # do the actual heavy lifting
+        self.setup_master()
+        self.create_network()
+        self.create_zones()
+
+    ############################################################################
+    def peer_to_external(self, peers, external_list):
+        """
+        create peering and security controls for controller into grid
+        """
+
+        for external in external_list:
+            self._peer_to_external(peers, external)
+
+    def _peer_to_external(self, peers, external):
+        ext_vpc = external.cache.vpc
+        my_vpc = self.cache.vpc
+
+        # don't peer to ourself
+        if ext_vpc.id == my_vpc.id:
+            return
+
+        # peer points are bi-directional
+        peer_key = "\t".join(sorted([my_vpc.id, ext_vpc.id]))
+        pcx = peers.get(peer_key)
+        if not pcx:
+            ext_region = external.cache.aws.region_name
+            ext_acct = external.cache._account_id_
+            my_region = self.cache.aws.region_name
+
+            ec2 = external.cache.ec2
+
+            self.log("vpc peering ({}) to {}({})",
+                     self.cache.aws.region_name,
+                     external.label,
+                     external.cache.aws.region_name)
+
+            pcx = self.cache.vpc.request_vpc_peering_connection(
+                PeerOwnerId=ext_acct,
+                PeerVpcId=ext_vpc.id,
+                PeerRegion=ext_region)
+
+            peers[peer_key] = pcx
+
+            self.log("peer point id {}".format(pcx.id))
+
+            # TODO: when one region is deleted and the other remains; trap this
+            # cleanup and redo it properly
+            request = ec2.VpcPeeringConnection(pcx.id)
+            request.wait_until_exists()
+            ignore_boto('VpcPeeringConnectionAlreadyExists', request.accept)
+
+        # grid 2 controller VPC
+        self.log("route {}: {} -> {}", my_vpc.id, external.target.network.cidr, pcx.id)
+        ignore_boto('RouteAlreadyExists',
+            self.cache.route_table.create_route,
+            DestinationCidrBlock=external.target.network.cidr,
+            GatewayId=pcx.id
+        )
+
+        # controller 2 grid VPC
+        self.log("route {}: {} -> {}", ext_vpc.id, self.target.network.cidr, pcx.id)
+        ignore_boto('RouteAlreadyExists',
+            external.cache.route_table.create_route,
+            DestinationCidrBlock=self.target.network.cidr,
+            GatewayId=pcx.id
+        )
+
+################################################################################
+class Cli(rfxcmd.CliRoot):
+    """BJG: I loathe argparse, use reflex's instead"""
+    def __init__(self):
+        self.cmd = os.path.basename(sys.argv[0])
+        self.args = Args(
+            ["spec-file", {
+                "type": "set-value"
+            }],
+            ["--dry-run|--test", {
+                "type": "set-true"
+            }],
+            ["--debug", {
+                "type": "set-true"
+            }],
+            ["--doctest", {
+                "type": "set-true"
+            }],
+        )
+        super(Cli, self).__init__(self.cmd)
+
+    ############################################################################
+    def syntax(self):
+        return "Usage: " + self.cmd + """ {spec-file} [options]
+
+{spec-file} is the file to read from, such as spec.yml, or `@` for stdin
+
+[options] can be:
+
+  --dry-run  -- just review/assert, don't change
+  --doctest  -- run internal doctests (develoment)
+"""
+
+    ############################################################################
+    def main(self):
+        """primary entrypoint"""
+        args = dictlib.Obj(self.args.handle_parse(caller=self))
+        if args.get('--doctest'):
+            import doctest
+            doctest.testmod()
+            sys.exit()
+
+        if args.get('--debug'):
+            globals()['DEBUG'] = True
+
+        specfile = args.get('spec-file')
+        spec = dictlib.Obj(load_data_file(specfile, abort=self.fail))
+
+        definitions = dict()
+        primary_controller = None
+        controllers = list()
+
+        # .__original__() is to get clean keys, not the extra dictlib keys
+        for name in spec.get('deploy').__original__():
+            name = name.lower()
+
+            # verify the name is okay
+            match = re.search(r'^([a-z-]+)([a-z])(\d+)$', name)
+            assert match, "target id must be like: p1, d2, etc ([a-z-][a-z]\\d+), not " + name
+            target_id = dict(
+                token=name,
+                prefix=match.group(1),
+                label=match.group(2),
+                number=match.group(3),
+            )
+            target = spec.deploy.get(name)
+
+            # what type/profile of object are we deploying?  controller/grid
+            profile = target.get('profile', 'oz')
+
+            good(target, "{}: {}.{} is invalid", specfile, profile, name)
+            target.update(dictlib.Obj({'id': target_id}))
+
+            # change the type here, but that is okay, just a more mature version
+            target = Provider(args, spec=spec, target=target, profile=profile)
+            if profile == 'controller':
+                if target.target.get('failover'):
+                    target.setup_failover()
+                else:
+                    if primary_controller:
+                        sys.exit("Cannot use {}, primary controller already defined ({})"
+                                 .format(name, primary_controller.target.id.token))
+                    else:
+                        primary_controller = target
+                        target.setup_primary()
+                controllers.append(target)
+            else:
+                target.setup_primary() # pylint: disable=no-member
+
+            if not definitions.get(profile):
+                definitions[profile] = list()
+            definitions[profile].append(target)
+
+#            print(json_dumps(definitions['grid'], indent=2))
+#            print(json_dumps(spec, indent=2))
+#            print(yaml.dump(definitions)) # , indent=2))
+
+            target.setup_network(spec=spec)
+
+#        peers = dict()
+#        for controller in controllers:
+#            controller.peer_to_external(peers, controllers)
+
+        # here do advanced things
+#        for grid in definitions.get('grid'):
+#            grid.peer_to_external(peers, controllers)
+#            grid.setup_network(controllers)
+
+################################################################################
+# lame json library doesn't support encoding more easily
+class JSONHackEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ProviderAws):
+            return str(obj)
+        else:
+            return json.JSONEncoder.default(self, obj)
+
+def json_dumps(data, *args, **kwargs):
+    """ Call json_dumps() instead of json.dumps() """
+    return json.dumps(data, *args, **kwargs, cls=JSONHackEncoder)
+
+def as_aws_netblock(targets):
+    # TODO: add check for security group reference
+    for x in range(0, len(targets)):
+        if isinstance(targets[x], str):
+            targets[x] = {'CidrIp': targets[x]}
+    return targets
+
+################################################################################
+if __name__ == '__main__':
+    Cli().main()

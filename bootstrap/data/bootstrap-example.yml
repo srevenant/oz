@@ -1,0 +1,127 @@
+version: 1.0
+
+################################################################################
+# specify a network breakdown template, to be used later
+templates:
+  grid-18:
+    zones:
+    - name: ssz  # Security Scanning Zone
+      count: 1   # only need one of these
+      mask: /24  # the zone is a /24--this is a construct outside of AWS
+      slice: /24 # the slice is a /24 (we only need one)
+                 # because this is only a single, our calculations will find a gap here, this is okay
+    - name: mgz  # Management Zone
+      count: 3   # 3 slices
+      mask: /21  # use a /21 for the zone
+      slice: /23 # an each slice is a /23
+    - name: dmz  # De-Militarized Zone
+      count: 3
+      mask: /21
+      slice: /23
+    - name: dbz  # Database Zone
+      count: 3
+      mask: /21
+      slice: /23
+    - name: apz  # Application Zone
+      count: 3
+      mask: /19
+      slice: /21
+
+################################################################################
+resources:
+  providers:
+    aws-p1:
+      type: aws
+      one-time-admin:
+        profile: default # in ~/.aws/credentials
+        # aws_access_key_id:     # alternative
+        # aws_secret_access_key: # alternative
+
+  ssh-keys:
+    test.0:
+      name: test.0 # support an auto-generated name?
+      file: id_rsa # or ~/keys/us-west-2.0 or .pub also
+      # material: xxx # or embed the key material here
+
+  network-groups:
+    # network groups are still a work in progress, not all of this is used
+    public:
+    - '0.0.0.0/0'
+    dbin-sources:
+    - '0.0.0.0/0'
+    gateway:
+    - '10.89.175.108/32'
+    vpn-p1ap1:
+    - '10.1.2.3/32'
+    sub:
+    - '10.43.15.53/32'
+    - '@vpn-p1ap1'
+    office: '11.2.3.4/32'
+    ntp-hosts:
+    - '129.6.15.30/32'  # time-c.nist.gov
+    - '129.6.15.27/32'  # time-d.nist.gov
+    - '132.163.97.3/32' # time-c-wwv.nist.gov
+    - '132.163.97.4/32' # time-d-wwv.nist.gov
+    - '132.163.96.2/32' # time-b.nist.gov
+
+    dmz-public:
+    - '@public'
+
+    admin-inbound:
+    - '@public'
+
+  firewall-rules:
+    # future plan, right now this is hardwired in the script so this section is ignored
+    dmz-kubes:
+      ingress:
+        src:
+        - '@public'
+        # figure out how to get sg-{name}.id
+        protocol:
+        - 'tcp/80'
+        - 'tcp/443'
+        - 'tcp/22'
+        - 'icmp/-1'
+
+    dmz-dbin:
+      ingress:
+        src:
+        - '@dbin-sources'
+        protocol:
+        - 'tcp/1433'
+
+    mgz-kubes:
+      ingress:
+        src:
+        - '@dmz-kubes'
+        - '@mgz-kubes'
+        protocol:
+        - 'tcp/*'
+
+    apz-kubes:
+      ingress:
+        src:
+        - '@dmz-kubes'
+        protocol:
+        - 'tcp/*'
+
+    OUT-ALL:
+      egress:
+        dst:
+        - 'any'
+        protocol:
+        - 'tcp/*'
+        - 'udp/*'
+
+################################################################################
+# this is what we actually are deploying
+deploy:
+  icv-p1:
+    failover: false # expanded functionality includes multiple grids that can failover to each other
+    provider:
+      name: aws-p1  # from resource.provider above
+      region: us-west-2
+    ssh-key: test.0 # from resource.ssh_keys above
+    network:
+      start: 10.0.0.0/18  # what block should we use?
+      template: grid-18   # what template to apply?

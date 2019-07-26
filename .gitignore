@@ -1,0 +1,14 @@
+p3
+/**/*.pyc
+/**/__pycache__
+/**/*.egg-info
+.tox
+_test-tmp
+
+*.swp
+*.swc
+
+/**/_build
+/**/_deps
+
+ref

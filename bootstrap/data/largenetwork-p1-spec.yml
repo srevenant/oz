@@ -1,0 +1,155 @@
+version: 1.0
+
+################################################################################
+templates:
+  grid-18:
+    zones:
+    - name: ssz
+      count: 1
+      mask: /24
+      slice: /24
+    - name: mgz
+      count: 3
+      mask: /21
+      slice: /23
+    - name: dmz
+      count: 3
+      mask: /21
+      slice: /23
+    - name: dbz
+      count: 3
+      mask: /21
+      slice: /23
+    - name: apz
+      count: 3
+      mask: /19
+      slice: /21
+
+################################################################################
+resources:
+  providers:
+    aws-prd:
+      type: aws
+      one-time-admin:
+        aws_access_key_id: AKI...
+        aws_secret_access_key: vszg...
+    aws-dev:
+      type: aws
+      one-time-admin:
+        aws_access_key_id: AKI...
+        aws_secret_access_key: vszg...
+
+  ssh-keys:
+    test.0:
+      name: larger.0
+      file: /data/larger
+
+  network-groups:
+    public:
+    - '0.0.0.0/0'
+    exigo-sources:
+    - '0.0.0.0/0'
+    gateway:
+    - '10.89.175.108/32'
+    vpn-p1ap1:
+    - '10.1.2.3/32'
+    sub:
+    - '10.43.15.53/32'
+    - '@vpn-p1ap1'
+    office: '11.2.3.4/32'
+    ntp-hosts:
+    - '129.6.15.30/32'  # time-c.nist.gov
+    - '129.6.15.27/32'  # time-d.nist.gov
+    - '132.163.97.3/32' # time-c-wwv.nist.gov
+    - '132.163.97.4/32' # time-d-wwv.nist.gov
+    - '132.163.96.2/32' # time-b.nist.gov
+
+    dmz-public:
+    - '@public'
+
+    admin-inbound:
+    - '@public'
+
+  firewall-rules:
+    dmz-kubes:
+      ingress:
+        src:
+        - '@public'
+        # figure out how to get sg-{name}.id
+        services:
+        - 'tcp/80'
+        - 'tcp/443'
+        - 'tcp/22'
+        - 'icmp/-1'
+
+    dmz-exigo:
+      ingress:
+        src:
+        - '@exigo-sources'
+        services:
+        - 'tcp/3306'
+
+    mgz-kubes:
+      ingress:
+        src:
+        - '@dmz-kubes'
+        - '@mgz-kubes'
+        services:
+        - 'all'
+
+    apz-kubes:
+      ingress:
+        src:
+        - '@dmz-kubes'
+        services:
+        - 'all'
+
+    OUT-ALL:
+      egress:
+        dst:
+        - 'any'
+        services:
+        - 'all'
+
+################################################################################
+deploy:
+  icv-p1:
+    failover: false
+    provider:
+      name: aws-prd
+      region: us-west-2
+    ssh-key: test.0
+    network:
+      start: 10.64.0.0/16
+      template: grid-18
+    peer: icv-p2
+  icv-p2:
+    failover: false
+    provider:
+      name: aws-prd
+      region: us-west-2
+    ssh-key: test.0
+    network:
+      start: 10.72.0.0/16
+      template: grid-18
+    peer: icv-p1
+  icv-d1:
+    failover: false
+    provider:
+      name: aws-dev
+      region: us-west-2
+    ssh-key: test.0
+    network:
+      start: 10.96.0.0/16
+      template: grid-18
+    peer: icv-d1
+  icv-d2:
+    failover: false
+    provider:
+      name: aws-dev
+      region: us-west-2
+    ssh-key: test.0
+    network:
+      start: 10.96.0.0/16
+      template: grid-18
+    peer: icv-d2

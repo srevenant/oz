@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import datetime
+import boto3
+import json
+import argparse
+import oz
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('config')
+    parser.add_argument('--example', action="store_true")
+    args = parser.parse_args()
+
+    if args.example:
+        print("""
+Config Example:
+{
+  "source": {
+    "instance": "rds-instance-id"
+  },
+  "target": {
+    "multi-az": false
+  }
+}
+        """)
+        sys.exit(0)
+
+    core = oz.OzCore(args)
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dbinstance = core.cfg.get('source').get('instance')
+
+    # get a client for rds
+    rds = core.aws.client('rds')
+
+    try:
+        result = rds.describe_db_instances(DBInstanceIdentifier=dbinstance)
+    except Exception as err:
+        sys.exit("{}".format(err))
+
+    instance = result['DBInstances'][0]
+    netgrp = instance['DBSubnetGroup']['DBSubnetGroupName']
+    secgrps = [grp['VpcSecurityGroupId'] for grp in instance['VpcSecurityGroups']]
+
+    snapshot = dbinstance + "-snap-" + stamp
+    new_instance = "fallback-" + dbinstance
+
+    print("--- Snapshot: " + snapshot)
+
+    result = rds.create_db_snapshot(
+            DBInstanceIdentifier=dbinstance,
+            DBSnapshotIdentifier=snapshot)
+
+    status = 'unknown'
+    while status != "available":
+        time.sleep(1)
+        result = rds.describe_db_snapshots(
+            DBInstanceIdentifier=dbinstance,
+            DBSnapshotIdentifier=snapshot)
+        status = result['DBSnapshots'][0]['Status']
+        percent = result['DBSnapshots'][0]['PercentProgress']
+        sys.stdout.write("\r    \r{}% {}, elapsed {} seconds".format(percent, status, int(time.time()-core.start)))
+        sys.stdout.flush()
+
+    print("")
+    print("--- Creating new instance: " + new_instance)
+    result = rds.restore_db_instance_from_db_snapshot(
+        DBInstanceIdentifier=new_instance,
+        DBSnapshotIdentifier=snapshot,
+        DBInstanceClass='db.r4.4xlarge',
+        StorageType="gp2",
+        PubliclyAccessible=False,
+        MultiAZ=core.cfg.get("target").get("multi-az"),
+        AutoMinorVersionUpgrade=True,
+        DBSubnetGroupName=netgrp)
+    
+    status = 'unknown'
+    while status != 'available':
+        time.sleep(1)
+        result = rds.describe_db_instances(
+          DBInstanceIdentifier=new_instance)
+        status = result['DBInstances'][0]['DBInstanceStatus']
+        sys.stdout.write("\r    \r{}, elapsed {} seconds".format(status, int(time.time()-core.start)))
+        sys.stdout.flush()
+
+    result = rds.modify_db_instance(
+        DBInstanceIdentifier=new_instance,
+        VpcSecurityGroupIds=secgrps
+    )
+#    print(result)
+
+    print("")
+    print("--- Total time: {} seconds".format(int(time.time()-core.start)))
+
+
+################################################################################
+if __name__ == '__main__':
+    main()

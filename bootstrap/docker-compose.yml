@@ -1,0 +1,8 @@
+version: "3.3"
+services:
+  cli:
+    build: .
+    volumes:
+      - ./data/:/data/
+      - ~/.ssh:/root/.ssh:ro
+      - ~/.aws:/root/.aws:ro

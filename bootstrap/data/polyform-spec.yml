@@ -1,0 +1,105 @@
+version: 1.0
+
+################################################################################
+templates:
+  grid-18:
+    zones:
+    - name: apz-lambda
+      count: 3
+      mask: /21
+      slice: /24
+    - name: dmz
+      count: 3
+      mask: /21
+      slice: /23
+    - name: mgz
+      count: 3
+      mask: /21
+      slice: /23
+
+################################################################################
+resources:
+  providers:
+    aws-p1:
+      type: aws
+      one-time-admin:
+        profile: cantilever # in ~/.aws/credentials
+        # aws_access_key_id: # alternative
+        # aws_secret_access_key: # alternative
+
+  ssh_keys:
+    test.0:
+      name: test.0 # support an auto-generated name?
+      file: id_rsa # or ~/keys/us-west-2.0 or .pub also
+      # if file -- we need to get it loaded into nbu too
+      # material: yyy
+
+  network-groups:
+    public:
+    - '0.0.0.0/0'
+    public-api:
+      -
+    admin-from:
+      - '205.197.218.56/32'
+    vpn-from:
+      - '@admin-from'
+    office-from:
+      - '@admin-from'
+    ntp-hosts:
+      - '129.6.15.30/32'  # time-c.nist.gov
+      - '129.6.15.27/32'  # time-d.nist.gov
+      - '132.163.97.3/32' # time-c-wwv.nist.gov
+      - '132.163.97.4/32' # time-d-wwv.nist.gov
+      - '132.163.96.2/32' # time-b.nist.gov
+    admin:
+      - '@admin-from'
+    user:
+      - '@office-from'
+      - '@admin-from'
+  firewall-rules:
+    dmz-in-http:
+      ingress:
+        src:
+        - '@public'
+        services:
+        - 'tcp/80'
+        - 'tcp/443'
+
+    mgz-in-admin:
+      ingress:
+        src:
+        - '@public'
+        services:
+        - 'tcp/80'
+        - 'tcp/443'
+        - 'tcp/22'
+
+    OUT-ALL:
+      egress:
+        dst:
+        - '@ntp-hosts'
+        services:
+        - 'udp/123'
+      ingress:
+        src:
+        - '@ntp-hosts'
+        services:
+        - 'udp/123'
+
+################################################################################
+# limits: cross-region VPC peering is restricted to:
+#   us-east-1  US East (N. Virginia)
+#   us-east-2  US East (Ohio)
+#   us-west-2  US West (Oregon)
+#   eu-...     EU (Ireland)
+deploy:
+  pd-p1:
+    profile: grid
+    provider:
+      name: aws-p1
+      region: us-west-2
+    ssh_key: test.0
+    network:
+      start: 10.50.0.0/18
+      template: grid-18
+    modules:
