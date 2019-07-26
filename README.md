@@ -1,13 +1,15 @@
 # AWS phonetic -> Oz
 
-Oz is tooling to ease scriptable AWS, beyond boto, and simpler than terraform and others.
+Oz is tooling to ease scriptable AWS, beyond boto, and simpler than terraform/salt and other
+conventional stack automation tools (oz doesn't require the heavy overhead required by these,
+just python, which is useful for some lean cases).
 
-It is a _Work in Progress_, as I consolidate from a variety of hodge podge utilities and clean them up.
+It is a _Work in Progress_, as I consolidate from a variety of hodge-podge utilities and clean them up.
 
 The first tool:
 
-  *oz-aws-bootstrap* - create an securely designed VPC in Amazon
-
+  *oz-aws-bootstrap* - create an securely designed VPC in Amazon (available in a container)
+  *rds-snap-clone* - automate a snapshot->clone of an EC2 instance
 
 # oz-aws-bootstrap
 
