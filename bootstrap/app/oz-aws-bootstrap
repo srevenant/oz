@@ -653,17 +653,20 @@ class ProviderAws(ProviderRoot):
 
         # TODO: check if it exists, don't change if it does
 
-        def get_instance_value(key, astype, default=None):
-            value = dictlib.dig_get(instance, key)
+        def get_value(src, base, key, astype, default=None):
+            value = dictlib.dig_get(src, key)
             if not value:
                 value = default
             if value is None:
-                sys.exit("Instance definition `{}` is missing `{}`"
-                         .format(instance_name, key))
+                print("dict={}".format(src))
+                print("key={}".format(key))
+                sys.exit("`{}` is missing `{}`".format(base, key))
             if not isinstance(value, astype):
-                sys.exit("instance `{}` parameter `{}` is not a {}"
-                         .format(instance_name, key, astype))
+                sys.exit("`{}.{}` is not a {}" .format(base, key, astype))
             return value
+
+        def get_instance_value(key, astype, default=None):
+            return get_value(instance, instance_name, key, astype, default)
 
         def resolve_subnet_id(zone=None):
             labeled_zone = self.stamp_label(zone)
@@ -697,9 +700,42 @@ class ProviderAws(ProviderRoot):
             sys.exit("instance `{}` keypair `{}` is not defined (see resources.ssh_keys)"
                      .format(instance_name, keypair))
 
+        def resolve_interfaces(sgs=None):
+            interfaces = []
+            idx = 0
+            for interface in get_instance_value('network.interfaces', list):
+                key = "network.interfaces[{}].".format(idx)
+                interfaces.append(dict(
+                    Groups=sgs,
+                    DeviceIndex=idx,
+                    SubnetId=subnet_id,
+                    DeleteOnTermination=get_instance_value(key + 'delete-on-termination', bool, True),
+                    AssociatePublicIpAddress=get_instance_value(key + 'associate-public-ip', bool, False)
+                ))
+                idx += 1
+            return interfaces
+
+        def resolve_blockdevs():
+            blkdevs = []
+            elem = 0
+            for dev in get_instance_value('volumes', list, []):
+                parent = '{}.volumes[{}]'.format(instance_name, elem)
+                ebs = get_value(dev, parent, 'ebs', dict)
+                blkdevs.append(dict(
+                    DeviceName=get_value(dev, parent, 'device', str),
+                    Ebs=dict(
+                        VolumeSize=get_value(ebs, parent + '.ebs', 'size', int),
+                        DeleteOnTermination=get_value(ebs, parent + '.ebs', 'delete-on-termination', int)
+                    )
+                ))
+                elem += 1
+            return blkdevs
+
         subnet_id = resolve_subnet_id(zone=get_instance_value('network.zone', str))
-        sgroups = resolve_security_groups(grps=get_instance_value('network.firewall-groups', list))
+        sgs = resolve_security_groups(grps=get_instance_value('network.firewall-groups', list))
         keypair = resolve_keypair(get_instance_value('keypair', str))
+        interfaces = resolve_interfaces(sgs=sgs)
+        blockdevs = resolve_blockdevs()
 
         item, _ = self.present(
             'instance',
@@ -707,24 +743,12 @@ class ProviderAws(ProviderRoot):
             self.cache.ec2,
             ImageId=get_instance_value('ami', str),
             InstanceType=get_instance_value('type', str),
-            BlockDeviceMappings=[dict(
-                DeviceName="/dev/sda1",
-                Ebs=dict(
-                    VolumeSize=8,
-                    DeleteOnTermination=True
-                )
-            )],
+            NetworkInterfaces=interfaces,
+            BlockDeviceMappings=blockdevs,
             MinCount=1,
             MaxCount=1,
             KeyName=keypair.name,
-            UserData='',
-            NetworkInterfaces=[dict(
-                Groups=sgroups,
-                DeviceIndex=0,
-                SubnetId=subnet_id,
-                DeleteOnTermination=True,
-                AssociatePublicIpAddress=get_instance_value('network.associate-public-ip', bool, False)
-            )],
+            UserData=''
         )
         self.log("instance {} public-ip={} private-ip={}"
                  .format(instance_name, item.public_ip_address, item.private_ip_address))

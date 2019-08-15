@@ -16,6 +16,10 @@ templates:
       count: 3
       mask: /21
       slice: /23
+    - name: apz
+      count: 3
+      mask: /21
+      slice: /24
 
 ################################################################################
 resources:
@@ -60,7 +64,7 @@ resources:
       - '@office-from'
       - '@admin-from'
   firewall-rules:
-    dmz-in-http:
+    in-http:
       ingress:
         src:
         - '@public'
@@ -68,13 +72,11 @@ resources:
         - 'tcp/80'
         - 'tcp/443'
 
-    mgz-in-admin:
+    in-admin:
       ingress:
         src:
         - '@public'
         services:
-        - 'tcp/80'
-        - 'tcp/443'
         - 'tcp/22'
 
     OUT-ALL:
@@ -124,16 +126,39 @@ deploy:
     # this is meant to be a minimal bootstrap VM creation, nothing fancy
     # to bring in saltstack, for example
     instances:
-      saltmaster-p1:
+      docker-p1:
         ami: ami-01ed306a12b7d1c96
         keypair: oz-provision.0
-        type: t2.micro
+        type: t3a.micro
         # network name as defined in templates.{grid}.zones -- it will randomly select a subnet
         network:
-          zone: mgz
+          zone: apz
           # this comes from {resources.firewall-rules.<name>}
           firewall-groups:
-            - salt-master
-            - salt-slave
-            - mgz-in-admin
-          associate-public-ip: true
+          - in-http
+          - in-admin
+          interfaces:
+          - associate-public-ip: true
+            delete-on-termination: true
+        volumes:
+        - device: /dev/sda1
+          ebs:
+            size: 8
+            delete-on-termination: true
+
+
+#      saltmaster-p1:
+#        ami: ami-01ed306a12b7d1c96
+#        keypair: oz-provision.0
+#        type: t3a.micro
+#        # network name as defined in templates.{grid}.zones -- it will randomly select a subnet
+#        network:
+#          zone: mgz
+#          # this comes from {resources.firewall-rules.<name>}
+#          firewall-groups:
+#            - salt-master
+#            - salt-slave
+#            - mgz-in-admin
+#          interfaces:
+#          - associate-public-ip: true
+#            delete-on-termination: true
