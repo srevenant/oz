@@ -643,8 +643,9 @@ class ProviderAws(ProviderRoot):
     ############################################################################
     def create_instances(self):
         """For each instance in instances..."""
-        for instance in self.target.instances.__original__():
-            self.create_instance(instance, self.target.instances[instance])
+        if self.target.get('instances'):
+            for instance in self.target.instances.__original__():
+                self.create_instance(instance, self.target.instances[instance])
 
     ############################################################################
     def create_instance(self, instance_name, instance):
@@ -907,7 +908,7 @@ class ProviderAws(ProviderRoot):
                 subs.append(sub)
                 self.log("net block {} {}".format(label, format_net(ipcalc.Network(subdetail.cidr))))
 
-            zone_trim = zone.__export__()
+            zone_trim = zone.__original__()
             del zone_trim['mask']
             del zone_trim['slice']
             del zone_trim['count']
