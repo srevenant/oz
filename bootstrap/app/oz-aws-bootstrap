@@ -26,6 +26,7 @@ from rfx.optarg import Args
 import rfxcmd
 import ipcalc
 import json
+import random
 
 # TODO & notes:
 # - switch token from end to beginning of names
@@ -165,66 +166,6 @@ def format_net(net):
         .format(str(net.network()) + "/" + str(net.mask),
                 net.size(), net.host_first(), net.host_last())
 
-############################################################################
-## TODO: support a security group reference as well as @group.
-def group_expand(scan, cache={}, sortvals=False):
-    """
-    Accept a dictionary `scan` with values as lists or strings. Recursively
-    walk the keys and values, converting all values to lists and expanding any
-    @name value, to be a set union including the @name from the `scan`
-    value, or `cache` (a dict to use as a secondary priority, when key cannot be
-    found).
-
-    Note: sortvals=True is just to help the doctest values to match properly
-
-    >>> group_expand({"a":["x","y"], "b":"z", "c":["x","Z"]}, sortvals=True)
-    {'a': ['x', 'y'], 'b': ['z'], 'c': ['Z', 'x']}
-    """
-    out = dictlib.Obj()
-
-    for key in scan:
-        val = scan[key]
-        if isinstance(val, str):
-            val = [val]
-        new_val = group_expand_values(val, key=key, outer=out, cache=cache, sortvals=sortvals)
-
-        if sortvals:
-            out[key] = sorted(new_val)
-        else:
-            out[key] = new_val
-
-    return out
-
-def group_expand_values(values, key='', outer={}, cache={}, sortvals=False):
-    new_val = set()
-    for elem in values:
-        if not elem:
-            continue
-#        if not isinstance(elem, str):
-#            expn_val.append(elem)
-#            continue
-        if elem[0] == '@':
-            ref_key = elem[1:]
-            ref_val = None
-            if outer.get(ref_key):
-                ref_val = outer.get(ref_key)
-            elif cache.get(ref_key):
-                ref_val = cache.get(ref_key)
-            good(ref_val,
-                 "Reference group {} is not defined before {} where it is referenced",
-                 elem, key)
-            if isinstance(ref_val, list):
-                for item in ref_val:
-                    if isinstance(item, dict):
-                        if item.get('CidrIp'):
-                            new_val.add(item['CidrIp'])
-                        else:
-                            sys.exit("group_expand cannot insert a dictionary")
-                    else:
-                        new_val.add(item)
-        else:
-            new_val.add(elem)
-    return list(new_val)
 
 ################################################################################
 # pylint: disable=too-few-public-methods
@@ -342,7 +283,7 @@ class ProviderAws(ProviderRoot):
 
     ############################################################################
     def setup_master(self):
-        """setup nanobox access to provider"""
+        """setup a master/management cluster"""
         self.add_ssh_key()# self.target.ssh_key)
 
         # TODO: create an IAM user & policies for the rest of this
@@ -390,12 +331,14 @@ class ProviderAws(ProviderRoot):
     def boto_get(self, obj, cstr, filters):
         items = getattr(obj, cstr + 's')
         matches = dict()
-        for item in items.filter(Filters=filters): #[{'Name': 'tag:Name', 'Values' : [label]}]):
+        if cstr == 'instance':
+            filters.append({'Name': 'instance-state-name', 'Values': ['pending', 'running', 'shutting-down', 'stopping', 'stopped']})
+        for item in items.filter(Filters=filters):
             matches[item.id] = item
         match_keys = list(matches.keys())
         if len(match_keys) > 1:
             print(match_keys)
-            raise TypeError("Too many mathes for {}={}".format(cstr, filters))
+            raise TypeError("Too many matches for {}={}".format(cstr, filters))
 
         elif len(match_keys) == 1:
             return matches[match_keys[0]]
@@ -413,54 +356,68 @@ class ProviderAws(ProviderRoot):
         `obj` is the boto3 object to use in the call
         `*args` and `**kwargs` are sent onto the boto3 object create
         """
+        def waitfor(item):
+            waited = False
+            for x in ('available', 'exists'):
+                try:
+                    #print("wait_until_" + x)
+                    getattr(obj, 'wait_until_' + x)()
+                    waited = True
+                except AttributeError:
+                    pass # try the next
+
+            if waited:
+                while state != 'available':
+                    try:
+                        avitem = self.boto_get(obj, cstr,
+                            [{'Name': cstr.replace('_','-') + '-id', 'Values' : [item.id]}]
+                        )
+                        if not avitem: # guess not
+                            state = 'available'
+                        else:
+                            state = avitem.state
+                            if state != 'available':
+                                time.sleep(1)
+                    except:
+                        # we tried, ohwell--not all AWS data is shaped the same
+                        state = 'available'
+
         # use our local cache; assumes no name duplication
-        existing = ' (existing)'
+        existing = 'existing'
         created = False
         if self.cache.get(label):
             item = self.cache.get(label)
-            existing = ' (existing; cached)'
+            existing += '; CACHED'
 
         # otherwise check remote and create if necessary
         else:
             item = self.boto_get(obj, cstr, [{'Name': 'tag:Name', 'Values' : [label]}])
+            if item and cstr == 'instance':
+                state = item.state['Name']
+                if state == 'terminated':
+                    item = None
+                existing += '; ' + state
             if not item:
-                item = None
+                items = None
                 try:
                     if self.commit:
-                        item = getattr(obj, 'create_' + cstr)(*args, **kwargs)
-                        if item == None:
+                        method = 'create_' + cstr
+                        if cstr == 'instance':
+                            method += 's'
+                        items = getattr(obj, method)(*args, **kwargs)
+                        if items == None:
                             sys.exit("{}.create_{}({}, {}) => None?".format(obj, cstr, args, kwargs))
-
-                        # try a couple of waiters
-                        waited = False
-                        for x in ('available', 'exists'):
-                            try:
-                                #print("wait_until_" + x)
-                                getattr(obj, 'wait_until_' + x)()
-                                waited = True
-                            except AttributeError:
-                                pass # try the next
+                        if not isinstance(items, list):
+                            items = [items]
 
                         # waiters aren't available at all levels
-                        if not waited:
-                            state = 'unknown'
-                            #print("trying other waits...")
-                            while state != 'available':
-                                try:
-                                    avitem = self.boto_get(obj, cstr, [{'Name': cstr.replace('_','-') + '-id', 'Values' : [item.id]}])
-                                    if not avitem: # guess not
-                                        state = 'available'
-                                    else:
-                                        state = avitem.state
-                                        if state != 'available':
-                                            time.sleep(1)
-                                except:
-                                    # we tried, ohwell--not all AWS data is shaped the same
-                                    state = 'available'
+                        for item in items:
+                            waitfor(item)
 
                         created = True
                         tagged = False
                         count=5
+
                         while not tagged:
                             try:
                                 #print("tag? {} Name={}".format(item.id, label))
@@ -483,6 +440,8 @@ class ProviderAws(ProviderRoot):
 
         if not item and not self.commit:
             sys.exit("Object {} doesn't exist, cannot continue in dry-run".format(label))
+        if existing:
+            existing = " (" + existing + ")"
         self.log("{} {} = {}{}", cstr, label, item.id, existing)
         return item, created
 
@@ -619,7 +578,8 @@ class ProviderAws(ProviderRoot):
             self.log("keypair " + ssh_key.name)
             self.cache.ec2.import_key_pair(
                 KeyName=ssh_key.name,
-                PublicKeyMaterial=ssh_key.material)
+                PublicKeyMaterial=ssh_key.material
+            )
 
     ############################################################################
     def create_network(self):
@@ -681,6 +641,94 @@ class ProviderAws(ProviderRoot):
         self.preload('subnet')
 
     ############################################################################
+    def create_instances(self):
+        """For each instance in instances..."""
+        for instance in self.target.instances.__original__():
+            self.create_instance(instance, self.target.instances[instance])
+
+    ############################################################################
+    def create_instance(self, instance_name, instance):
+        """create an ec2 instance"""
+
+        # TODO: check if it exists, don't change if it does
+
+        def get_instance_value(key, astype, default=None):
+            value = dictlib.dig_get(instance, key)
+            if not value:
+                value = default
+            if value is None:
+                sys.exit("Instance definition `{}` is missing `{}`"
+                         .format(instance_name, key))
+            if not isinstance(value, astype):
+                sys.exit("instance `{}` parameter `{}` is not a {}"
+                         .format(instance_name, key, astype))
+            return value
+
+        def resolve_subnet_id(zone=None):
+            labeled_zone = self.stamp_label(zone)
+
+            zone_found = None
+            for zone_def in self.target.network.zones:
+                if zone_def['label'] == labeled_zone:
+                    zone_found = zone_def
+                    break
+            if not zone_found:
+                sys.exit("Cannot find network zone `{}` for instance `{}`!"
+                         .format(zone, instance_name))
+            subnet = list(random.choice(zone_found['subnets']).keys())[0]
+            return self.cache.get(subnet).id
+
+        def resolve_security_groups(grps=None):
+            sg_ids = []
+            for fwname in grps:
+                lname = 'sg-' + self.stamp_label(fwname)
+                obj = self.cache.get(lname)
+                if not obj:
+                    sys.exit("instance `{}` firewall-group `{}` is not defined"
+                             .format(instance_name, fwname))
+                sg_ids.append(obj.id)
+            return sg_ids
+
+        def resolve_keypair(name=None):
+            for kp in self.cache.ec2.key_pairs.filter():
+                if kp.name == name:
+                    return kp
+            sys.exit("instance `{}` keypair `{}` is not defined (see resources.ssh_keys)"
+                     .format(instance_name, keypair))
+
+        subnet_id = resolve_subnet_id(zone=get_instance_value('network.zone', str))
+        sgroups = resolve_security_groups(grps=get_instance_value('network.firewall-groups', list))
+        keypair = resolve_keypair(get_instance_value('keypair', str))
+
+        item, _ = self.present(
+            'instance',
+            instance_name,
+            self.cache.ec2,
+            ImageId=get_instance_value('ami', str),
+            InstanceType=get_instance_value('type', str),
+            BlockDeviceMappings=[dict(
+                DeviceName="/dev/sda1",
+                Ebs=dict(
+                    VolumeSize=8,
+                    DeleteOnTermination=True
+                )
+            )],
+            MinCount=1,
+            MaxCount=1,
+            KeyName=keypair.name,
+            UserData='',
+            NetworkInterfaces=[dict(
+                Groups=sgroups,
+                DeviceIndex=0,
+                SubnetId=subnet_id,
+                DeleteOnTermination=True,
+                AssociatePublicIpAddress=get_instance_value('network.associate-public-ip', bool, False)
+            )],
+        )
+        self.log("instance {} public-ip={} private-ip={}"
+                 .format(instance_name, item.public_ip_address, item.private_ip_address))
+
+    ############################################################################
     def create_zones(self):
         """For each zone in zones..."""
         for zone in self.target.network.zones:
@@ -689,9 +737,9 @@ class ProviderAws(ProviderRoot):
     ############################################################################
     def create_zone(self, zone):
         """Create subnets for a specified zone"""
-        for keypair in zone.get('subnets'):
-            label = list(keypair.keys())[0]
-            cidr = keypair[label]
+        for zone_cidr in zone.get('subnets'):
+            label = list(zone_cidr.keys())[0]
+            cidr = zone_cidr[label]
 
             subnet, _ = self.present('subnet',
                                      label,
@@ -711,7 +759,7 @@ class ProviderAws(ProviderRoot):
 
         self._sec = dictlib.Obj()
         _groups = self.spec.get('resources', {}).get('network-groups', {})
-        self._sec['groups'] = groups = group_expand(_groups)
+        self._sec['groups'] = groups = self.group_expand(_groups)
         for grp in groups:
             groups[grp] = as_aws_netblock(groups[grp])
 
@@ -760,21 +808,24 @@ class ProviderAws(ProviderRoot):
 
     ############################################################################
     # pylint: disable=unused-variable
-    def setup_network(self, spec=None):
+    def setup_network(self):
         """Create network controls"""
         self._prep_security_controls()
 
         grps = self._sec['groups']
-        rules = spec.resources.firewall_rules
+        rules = self.spec.resources.firewall_rules
 
         for name in rules.__original__().keys():
             rule = rules[name]
-            for type in ('ingress.src', 'egress.dst'):
-                iplist = dictlib.dig_get(rule, type)
-                if iplist:
-                    dictlib.dug(rule, type, group_expand_values(iplist, cache=grps))
-                else:
-                    dictlib.dug(rule, type, None)
+            if not rule:
+                rule = dict(ingress=dict(src=[]), egress=dict(dst=[]))
+            else:
+                for type in ('ingress.src', 'egress.dst'):
+                    iplist = dictlib.dig_get(rule, type)
+                    if iplist:
+                        dictlib.dug(rule, type, self.group_expand_values(iplist, cache=grps, key=name))
+                    else:
+                        dictlib.dug(rule, type, None)
 
             target_rules = []
             target_hosts = []
@@ -947,6 +998,108 @@ class ProviderAws(ProviderRoot):
             GatewayId=pcx.id
         )
 
+    ############################################################################
+    ## TODO: support a security group reference as well as @group.
+    def group_expand(self, scan, cache={}, sortvals=False):
+        """
+        Accept a dictionary `scan` with values as lists or strings. Recursively
+        walk the keys and values, converting all values to lists and expanding any
+        @name value, to be a set union including the @name from the `scan`
+        value, or `cache` (a dict to use as a secondary priority, when key cannot be
+        found).
+
+        Note: sortvals=True is just to help the doctest values to match properly
+
+        >>> group_expand({"a":["x","y"], "b":"z", "c":["x","Z"]}, sortvals=True)
+        {'a': ['x', 'y'], 'b': ['z'], 'c': ['Z', 'x']}
+        """
+        out = dictlib.Obj()
+
+        for key in scan:
+            val = scan[key]
+            if isinstance(val, str):
+                val = [val]
+            new_val = self.group_expand_values(val, key=key, outer=out, cache=cache, sortvals=sortvals)
+
+            if sortvals:
+                out[key] = sorted(new_val)
+            else:
+                out[key] = new_val
+
+        return out
+
+    def group_expand_values(self, values, key='', outer={}, cache={}, sortvals=False):
+        new_val = set()
+
+
+        def expand_param(elem):
+            if elem[:4].lower() == 'net:':
+                sub_key = elem[4:].lower()
+                if sub_key == 'base':
+                    cidr = self.target.network.cidr
+                else:
+                    ## TODO: lookup zone by name and add self.stamp_label() as needed (so both `full-prefix-name-subnet` works AND just `name`)
+                    print(self.target)
+                    print(self.target.network)
+                    zones = self.target.network.zones
+                    sys.exit(0)
+#                        for zone in zones:
+#                            if zones[zone]['label'] ==
+                # working on making it more flexible... this fails as the zones[] block is an array, and dig doesn't support searching an array for an element name
+#                     print("DIG=" + sub_key)
+#                     cidr = dictlib.dig_get(self.target.network, sub_key)
+#                     print("=>{}".format(cidr))
+#                     if not cidr:
+#                         sys.exit("""group_expand @$NET:... cannot find a network, should be one of:\n
+# \t@$NET:cidr @$NET:zones.""" + " @$NET:zones.".join([zone['label'] for zone in self.target.network.zones])
+#                         + "\n\nbut we received:\n\n\t" + elem + "\n")
+                new_val.add(cidr)
+                return
+            if elem[:3].lower() == 'sg:':
+                sgname = 'sg-' + self.stamp_label(elem[3:])
+                sgo = self.cache.get(sgname)
+                if not sgo:
+                    sys.exit("group_expand reference to {} is not a security group!".format(sgname))
+                new_val.add('~' + sgo.id)
+                return
+            else:
+                sys.exit("group_expand parameter key `" + elem +
+                         "` does not resolve.  Try one of:\n\n\t" +
+                         "$net:base @$net:{network name} @$sg:{sg-name}")
+
+        def expand_group(elem):
+            ref_key = elem
+            ref_val = None
+            if outer.get(ref_key):
+                ref_val = outer.get(ref_key)
+            elif cache.get(ref_key):
+                ref_val = cache.get(ref_key)
+            good(ref_val,
+                 "Reference group `@{}` is not defined before `{}` where it is referenced",
+                 elem, key)
+            if isinstance(ref_val, list):
+                for item in ref_val:
+                    if isinstance(item, dict):
+                        if item.get('CidrIp'):
+                            new_val.add(item['CidrIp'])
+                        else:
+                            sys.exit("group_expand cannot insert a dictionary")
+                    else:
+                        new_val.add(item)
+
+        for elem in values:
+            if not elem:
+                continue
+            if elem[0] == '@':
+                if elem[1] == '$':
+                    expand_param(elem[2:])
+                else:
+                    expand_group(elem[1:])
+            else:
+                new_val.add(elem)
+
+        return list(new_val)
+
 ################################################################################
 class Cli(rfxcmd.CliRoot):
     """BJG: I loathe argparse, use reflex's instead"""
@@ -1044,8 +1197,9 @@ class Cli(rfxcmd.CliRoot):
 #            print(json_dumps(spec, indent=2))
 #            print(yaml.dump(definitions)) # , indent=2))
 
-            target.setup_network(spec=spec)
+            target.setup_network()
 
+            target.create_instances()
 #        peers = dict()
 #        for controller in controllers:
 #            controller.peer_to_external(peers, controllers)
@@ -1072,7 +1226,10 @@ def as_aws_netblock(targets):
     # TODO: add check for security group reference
     for x in range(0, len(targets)):
         if isinstance(targets[x], str):
-            targets[x] = {'CidrIp': targets[x]}
+            if targets[x][0] == '~': # security group reference:
+                targets[x] = {'GroupId': targets[x][1:]}
+            else:
+                targets[x] = {'CidrIp': targets[x]}
     return targets
 
 ################################################################################

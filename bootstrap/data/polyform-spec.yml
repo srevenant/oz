@@ -29,14 +29,17 @@ resources:
 
   ssh_keys:
     test.0:
-      name: test.0 # support an auto-generated name?
-      file: id_rsa # or ~/keys/us-west-2.0 or .pub also
+      name: oz-provision.0
+      file: oz-cantilever.0 # or ~/keys/us-west-2.0 or .pub also
       # if file -- we need to get it loaded into nbu too
       # material: yyy
 
   network-groups:
+    # @$NETWORK is a predefined tag representing the currently being provisioned network block, for the region
+    private-in-region:
+      - '@$net:base'
     public:
-    - '0.0.0.0/0'
+      - '0.0.0.0/0'
     public-api:
       -
     admin-from:
@@ -86,6 +89,21 @@ resources:
         services:
         - 'udp/123'
 
+    # use as a placeholder to map to a salt-master host later
+    salt-master:
+
+    salt-slave:
+      egress:
+        dst:
+        - '@$sg:salt-master'
+        services:
+        - 'tcp/4505-4506'
+      ingress:
+        src:
+        - '@$sg:salt-master'
+        services:
+        - 'tcp/4505-4506'
+
 ################################################################################
 # limits: cross-region VPC peering is restricted to:
 #   us-east-1  US East (N. Virginia)
@@ -103,3 +121,19 @@ deploy:
       start: 10.50.0.0/18
       template: grid-18
     modules:
+    # this is meant to be a minimal bootstrap VM creation, nothing fancy
+    # to bring in saltstack, for example
+    instances:
+      saltmaster-p1:
+        ami: ami-01ed306a12b7d1c96
+        keypair: oz-provision.0
+        type: t2.micro
+        # network name as defined in templates.{grid}.zones -- it will randomly select a subnet
+        network:
+          zone: mgz
+          # this comes from {resources.firewall-rules.<name>}
+          firewall-groups:
+            - salt-master
+            - salt-slave
+            - mgz-in-admin
+          associate-public-ip: true
